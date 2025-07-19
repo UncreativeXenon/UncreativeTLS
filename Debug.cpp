@@ -3,15 +3,15 @@
 #include <string.h>
 void debug_tls(const char* str)
 {
-    if(str)
+    /*if(str)
         printf("%s\n", str);
 
     FILE* fp = NULL;
-    errno_t err = fopen_s(&fp, "game:\\DebugInfo.txt", "a+");
+    errno_t err = fopen_s(&fp, "hdd:\\Plugins\DebugInfo.txt", "a+");
     if(fp) {
         fprintf(fp, "%s\n", str);
         fclose(fp);
-    }
+    }*/
 }
 void debug_hex(const char* label, const unsigned char* buf, int len)
 {

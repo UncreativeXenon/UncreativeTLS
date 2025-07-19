@@ -56,10 +56,41 @@
 #include <stdint.h>
 #include "Debug.h"
 #include "XboxTLS.h"
+#include "TLSClient.h"
+#include "xkelib.h"
 #define MAX_ANCHORS 8
+#define XNCALLER_SYSAPP 2
 static br_hmac_drbg_context g_drbg;
 
 extern "C" void XeCryptRandom(BYTE* pb, DWORD cb);
+
+// RFC 4648 Base64 Table
+static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+void base64_encode(const uint8_t *in, int in_len, char *out) {
+    int i = 0, j = 0;
+    for (; i < in_len;) {
+        uint32_t octet_a = i < in_len ? in[i++] : 0;
+        uint32_t octet_b = i < in_len ? in[i++] : 0;
+        uint32_t octet_c = i < in_len ? in[i++] : 0;
+
+        uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+
+        out[j++] = b64_table[(triple >> 18) & 0x3F];
+        out[j++] = b64_table[(triple >> 12) & 0x3F];
+        out[j++] = (i > in_len + 1) ? '=' : b64_table[(triple >> 6) & 0x3F];
+        out[j++] = (i > in_len)     ? '=' : b64_table[triple & 0x3F];
+    }
+    out[j] = '\0';
+}
+
+void generate_sec_websocket_key(char *output_key) {
+    uint8_t random_bytes[16];
+
+    XeCryptRandom(random_bytes, sizeof(random_bytes));
+
+    base64_encode(random_bytes, sizeof(random_bytes), output_key);
+}
 
 
 /*
@@ -85,9 +116,6 @@ br_prng_seeder_system(const char **name) {
     return &XboxTLS_CustomSeeder;
 }
 
-
-
-
 /*
  * Internal structure representing the state of an XboxTLS connection.
  * 
@@ -102,14 +130,32 @@ br_prng_seeder_system(const char **name) {
  *   - Bi-directional I/O buffer (iobuf)
  */
 struct XboxTLSInternal {
-    br_ssl_client_context sc;                    // BearSSL TLS client context
-    br_x509_minimal_context xc;                  // X.509 cert validation context (minimal)
-    br_sslio_context ioc;                        // I/O context for read/write abstraction
-    SOCKET sock;                                 // Underlying socket handle
-    br_x509_trust_anchor anchors[MAX_ANCHORS];   // Trust anchor certificates
-    int anchor_count;                            // Count of loaded anchors
-    unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];    // TLS I/O buffer
+    br_ssl_client_context sc;
+    br_x509_minimal_context xc;
+    br_sslio_context ioc;
+    SOCKET sock;
+    br_x509_trust_anchor anchors[MAX_ANCHORS];
+    int anchor_count;
+    unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
+
+    XboxTLS_LogCallback logCallback; // ✅ Per-context logger!
 };
+
+void XboxTLS_SetLogCallback(XboxTLSContext* ctx, XboxTLS_LogCallback callback) {
+    if (ctx && ctx->internal) {
+        XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+        ic->logCallback = callback;
+    }
+}
+
+static void tls_log(XboxTLSContext* ctx, const char* msg) {
+    if (ctx && ctx->internal) {
+        XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+        if (ic->logCallback) {
+            ic->logCallback(msg);
+        }
+    }
+}
 
 
 /*
@@ -152,7 +198,7 @@ const br_hash_class* XboxTLS_GetHashVTable(XboxTLSHash hash) {
  */
 static int tls_socket_read(void* ctx, unsigned char* buf, size_t len) {
     SOCKET s = *(SOCKET*)ctx;
-    return recv(s, (char*)buf, (int)len, 0);
+    return NetDll_recv(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), s, (char*)buf, (int)len, 0);
 }
 
 /*
@@ -171,7 +217,7 @@ static int tls_socket_read(void* ctx, unsigned char* buf, size_t len) {
  */
 static int tls_socket_write(void* ctx, const unsigned char* buf, size_t len) {
     SOCKET s = *(SOCKET*)ctx;
-    return send(s, (const char*)buf, (int)len, 0);
+    return NetDll_send(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), s, (const char*)buf, (int)len, 0);
 }
 
 
@@ -318,44 +364,50 @@ bool XboxTLS_AddTrustAnchor_EC(XboxTLSContext* ctx,
  *   - Only one connection can be active per XboxTLSContext at a time.
  *   - Use XboxTLS_Write / XboxTLS_Read for I/O after a successful connection.
  */
+
 bool XboxTLS_Connect(XboxTLSContext* ctx, const char* ip, const char* hostname, int port) {
     if (!ctx || !ctx->internal || !ip || !hostname) {
+        tls_log(ctx, "XboxTLS_Connect: Invalid arguments.");
         debug_tls("XboxTLS_Connect: Invalid arguments.");
         return false;
     }
 
     XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
 
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    //SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	SOCKET sock = NetDll_socket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET) {
+        tls_log(ctx, "Socket creation failed.");
         debug_tls("Socket creation failed.");
-        int wsaErr = WSAGetLastError();
+        int wsaErr = NetDll_WSAGetLastError();
         char debugBuf[64];
         sprintf(debugBuf, "WSA Error: %d", wsaErr);
-        debug_tls(debugBuf);
+        tls_log(ctx, debugBuf); debug_tls(debugBuf);
         return false;
     }
 
     BOOL opt_true = TRUE;
-    setsockopt(sock, SOL_SOCKET, 0x5801, (PCSTR)&opt_true, sizeof(BOOL));
+    NetDll_setsockopt(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock, SOL_SOCKET, 0x5801, (const char*)&opt_true, sizeof(BOOL));
 
     sockaddr_in sa;
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
     sa.sin_addr.s_addr = inet_addr(ip);
     if (sa.sin_addr.s_addr == INADDR_NONE) {
+        tls_log(ctx, "inet_addr failed: Invalid IP format.");
         debug_tls("inet_addr failed: Invalid IP format.");
-        closesocket(sock);
+        NetDll_closesocket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock);
         return false;
     }
 
-    if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
-        debug_tls("connect() failed.");
-        int wsaErr = WSAGetLastError();
+    if (NetDll_connect(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
+        tls_log(ctx, "connect() failed.");
+		debug_tls("connect() failed.");
+        int wsaErr = NetDll_WSAGetLastError();
         char debugBuf[64];
         sprintf(debugBuf, "WSA Error: %d", wsaErr);
-        debug_tls(debugBuf);
-        closesocket(sock);
+        tls_log(ctx, debugBuf); debug_tls(debugBuf);
+        NetDll_closesocket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock);
         return false;
     }
 
@@ -363,8 +415,9 @@ bool XboxTLS_Connect(XboxTLSContext* ctx, const char* ip, const char* hostname, 
 
     const br_hash_class* hash = XboxTLS_GetHashVTable(ctx->hashAlgo);
     if (!hash) {
+        tls_log(ctx, "Invalid hash algorithm specified.");
         debug_tls("Invalid hash algorithm specified.");
-        closesocket(sock);
+        NetDll_closesocket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock);
         return false;
     }
 
@@ -403,25 +456,44 @@ bool XboxTLS_Connect(XboxTLSContext* ctx, const char* ip, const char* hostname, 
  */
 int XboxTLS_Write(XboxTLSContext* ctx, const void* buf, int len) {
     if (!ctx || !ctx->internal || !buf || len <= 0) {
+        tls_log(ctx, "XboxTLS_Write: Invalid arguments.");
         debug_tls("XboxTLS_Write: Invalid arguments.");
         return -1;
     }
 
     XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
 
-    if (br_sslio_write_all(&ic->ioc, buf, len) < 0) {
-        int err = br_ssl_engine_last_error(&ic->sc.eng);
-        char msg[64];
-        sprintf(msg, "TLS write error code: %d", err);
-        debug_tls(msg);
-        return -1;
-    }
+	if (br_sslio_write_all(&ic->ioc, buf, len) < 0) {
+		int err = br_ssl_engine_last_error(&ic->sc.eng);
+		char msg[64];
+		sprintf(msg, "TLS write error code: %d", err);
+		tls_log(ctx, msg);
+		debug_tls(msg);
+
+		// 🔍 log WSA error too
+		int wsaErr = NetDll_WSAGetLastError();
+		char wsaMsg[64];
+		sprintf(wsaMsg, "WSA Error: %d", wsaErr);
+		tls_log(ctx, wsaMsg);
+		debug_tls(wsaMsg);
+
+		return -1;
+	}
 
     if (br_sslio_flush(&ic->ioc) != 0) {
         int err = br_ssl_engine_last_error(&ic->sc.eng);
         char msg[64];
         sprintf(msg, "TLS flush error code: %d", err);
+        tls_log(ctx, msg);
         debug_tls(msg);
+
+		// Optional: log WSA error
+        int wsaErr = NetDll_WSAGetLastError();
+        char wsaBuf[64];
+        sprintf(wsaBuf, "WSAGetLastError: %d", wsaErr);
+        tls_log(ctx, wsaBuf);
+        debug_tls(wsaBuf);
+
         return -1;
     }
 
@@ -445,22 +517,30 @@ int XboxTLS_Write(XboxTLSContext* ctx, const void* buf, int len) {
  */
 int XboxTLS_Read(XboxTLSContext* ctx, void* buf, int len) {
     if (!ctx || !ctx->internal || !buf || len <= 0) {
+        tls_log(ctx, "XboxTLS_Read: Invalid arguments.");
         debug_tls("XboxTLS_Read: Invalid arguments.");
         return -1;
     }
+
+	char msg2[128];
+	sprintf(msg2, "RecvWS: Reading %llu bytes payload", len);
+	//tls_log(ctx, msg2);
+	debug_tls(msg2);
 
     XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
 
     int r = br_sslio_read(&ic->ioc, buf, len);
     if (r <= 0) {
         int err = br_ssl_engine_last_error(&ic->sc.eng);
-        char msg[64];
-        sprintf(msg, "TLS read error code: %d", err);
-        debug_tls(msg);
+        char msg[128];
+        sprintf(msg, "TLS read failed: r=%d, br_ssl_engine_last_error=%d", r, err);
+        //tls_log(ctx, msg);
+		debug_tls(msg);
     }
 
     return r;
 }
+
 
 /*
  * Frees all internal memory and closes the TLS connection.
@@ -479,8 +559,13 @@ void XboxTLS_Free(XboxTLSContext* ctx) {
     if (!ctx || !ctx->internal) return;
     XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
 
-    closesocket(ic->sock);
+    // Close socket if open
+    if (ic->sock != INVALID_SOCKET && ic->sock != 0) {
+        NetDll_closesocket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), ic->sock);
+        ic->sock = INVALID_SOCKET;
+    }
 
+    // Free trust anchors
     for (int i = 0; i < ic->anchor_count; ++i) {
         free((void*)ic->anchors[i].dn.data);
         if (ic->anchors[i].pkey.key_type == BR_KEYTYPE_RSA) {
@@ -491,6 +576,203 @@ void XboxTLS_Free(XboxTLSContext* ctx) {
         }
     }
 
+    // Zero and free the internal struct
+    memset(ic, 0, sizeof(XboxTLSInternal));
     free(ic);
     ctx->internal = NULL;
+}
+
+bool XboxTLS_PerformWebSocketHandshake(XboxTLSContext* ctx, const char* host, const char* path) {
+	char websocket_key[25];  // 24 chars + null terminator
+    generate_sec_websocket_key(websocket_key);
+    char req[512];
+    sprintf(req,
+		"GET %s HTTP/1.1\r\n"
+		"Host: %s\r\n"
+		"Upgrade: websocket\r\n"
+		"Connection: Upgrade\r\n"
+		"Sec-WebSocket-Key: %s\r\n"
+		"Sec-WebSocket-Version: 13\r\n\r\n",
+    path, host, websocket_key);
+
+    XboxTLS_Write(ctx, req, (int)strlen(req));
+
+    char resp[1024];
+    int len = XboxTLS_Read(ctx, resp, sizeof(resp) - 1);
+    if (len <= 0) return false;
+    resp[len] = '\0';
+
+    return strstr(resp, "101 Switching Protocols") != NULL;
+}
+
+static inline uint64_t to_be64(uint64_t x) {
+    return ((x & 0xFFULL) << 56) |
+           ((x & 0xFF00ULL) << 40) |
+           ((x & 0xFF0000ULL) << 24) |
+           ((x & 0xFF000000ULL) << 8) |
+           ((x >> 8)  & 0xFF000000ULL) |
+           ((x >> 24) & 0xFF0000ULL) |
+           ((x >> 40) & 0xFF00ULL) |
+           ((x >> 56) & 0xFFULL);
+}
+
+/* ... existing XboxTLS.cpp content ... */
+
+/*
+ * Performs a WebSocket upgrade request over an existing TLS connection.
+ */
+bool XboxTLS_WebSocketUpgrade(XboxTLSContext* ctx, const char* host, const char* path, const char* origin) {
+    if (!ctx || !ctx->internal || !host || !path) return false;
+
+    char websocket_key[25];  // 24 chars + null terminator
+    generate_sec_websocket_key(websocket_key);
+    char request[512];
+    sprintf(request,
+		"GET %s HTTP/1.1\r\n"
+		"Host: %s\r\n"
+		"Upgrade: websocket\r\n"
+		"Connection: Upgrade\r\n"
+		"Sec-WebSocket-Version: 13\r\n"
+		"Sec-WebSocket-Key: %s\r\n"
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+		"Origin: %s\r\n"
+		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n"
+		"\r\n",
+    path, host, websocket_key, origin);
+
+    int sent = XboxTLS_Write(ctx, request, (int)strlen(request));
+    if (sent <= 0) return false;
+
+    char response[1024] = { 0 };
+    int r = XboxTLS_Read(ctx, response, sizeof(response) - 1);
+    if (r <= 0 || !strstr(response, "101 Switching Protocols")) return false;
+
+    return true;
+}
+
+/*
+ * Sends a WebSocket text frame (unmasked).
+ */
+bool XboxTLS_SendWebSocketFrame(XboxTLSContext* ctx, const void* data, size_t len) {
+    if (len > 65535) return false;
+
+    uint8_t header[10];
+    size_t i = 0;
+
+    header[i++] = 0x81; // FIN bit set, text frame
+
+    if (len <= 125) {
+        header[i++] = 0x80 | (uint8_t)len;
+    } else {
+        header[i++] = 0x80 | 126;
+        header[i++] = (len >> 8) & 0xFF;
+        header[i++] = len & 0xFF;
+    }
+
+    uint8_t mask[4] = {
+        static_cast<uint8_t>(rand() & 0xFF),
+        static_cast<uint8_t>(rand() & 0xFF),
+        static_cast<uint8_t>(rand() & 0xFF),
+        static_cast<uint8_t>(rand() & 0xFF)
+    };
+    memcpy(&header[i], mask, 4);
+    i += 4;
+
+    size_t total_len = i + len;
+    uint8_t* frame = new uint8_t[total_len];
+
+    memcpy(frame, header, i);
+
+    const uint8_t* data_bytes = static_cast<const uint8_t*>(data);
+    for (size_t j = 0; j < len; ++j) {
+        frame[i + j] = data_bytes[j] ^ mask[j % 4];
+    }
+
+    XboxTLS_Write(ctx, frame, static_cast<int>(total_len));
+    delete[] frame;
+
+    return true;
+}
+
+/*
+ * Receives a WebSocket text frame (unmasked, synchronous read).
+ * Caller must free the returned buffer.
+ */
+char* XboxTLS_ReceiveWebSocketFrame(XboxTLSContext* ctx, size_t* outLen, bool* isZlib) {
+    if (!ctx || !ctx->internal || !outLen || !isZlib) return NULL;
+
+    *isZlib = false;
+
+    unsigned char header[10];
+    if (XboxTLS_Read(ctx, header, 2) < 2) return NULL;
+
+    size_t len = header[1] & 0x7F;
+
+    if (len == 126) {
+        if (XboxTLS_Read(ctx, header + 2, 2) < 2) return NULL;
+        len = (header[2] << 8) | header[3];
+    } else if (len == 127) {
+        unsigned char extendedLen[8];
+        if (XboxTLS_Read(ctx, extendedLen, 8) < 8) return NULL;
+
+        len = 0;
+        for (int i = 0; i < 8; ++i) {
+            len = (len << 8) | extendedLen[i];
+        }
+
+        if (len > 6071080) {
+            tls_log(ctx, "Payload exceeds 6MB limit — assuming zlib, not returning payload.");
+            debug_tls("Payload exceeds 6MB limit — assuming zlib, not returning payload.");
+            *isZlib = true;
+            *outLen = len;
+            return NULL; // ⬅️ don't return the payload if it's zlib
+        }
+    }
+
+    char* payload = (char*)malloc(len + 1);
+    if (!payload) {
+        tls_log(ctx, "Failed to allocate memory for payload.");
+        debug_tls("Failed to allocate memory for payload.");
+        return NULL;
+    }
+
+    int totalRead = 0;
+    while (totalRead < (int)len) {
+        int r = XboxTLS_Read(ctx, payload + totalRead, (int)(len - totalRead));
+        if (r <= 0) {
+            free(payload);
+            return NULL;
+        }
+        totalRead += r;
+    }
+
+    payload[len] = '\0';
+    *outLen = len;
+    return payload;
+}
+
+bool XboxTLS_IsAlive(XboxTLSContext* ctx) {
+    if (!ctx || !ctx->internal) return false;
+    XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+    return ic->sock != INVALID_SOCKET && ic->sock != 0;
+}
+
+bool XboxTLS_HasFatalError(XboxTLSContext* ctx) {
+    if (!ctx || !ctx->internal) return true;
+    XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+    return br_ssl_engine_last_error(&ic->sc.eng) != 0;
+}
+
+bool XboxTLS_SocketDead(XboxTLSContext* ctx) {
+    if (!ctx || !ctx->internal) return true;
+    XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+
+    fd_set errSet;
+    timeval timeout = { 0, 0 };
+
+    FD_ZERO(&errSet);
+    FD_SET(ic->sock, &errSet);
+
+    int result = NetDll_select(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), ic->sock + 1, NULL, NULL, &errSet, &timeout);
+    return (result > 0 && FD_ISSET(ic->sock, &errSet));
 }

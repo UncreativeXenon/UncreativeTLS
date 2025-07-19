@@ -1,0 +1,26 @@
+# Visual Studio general
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sdf
+*.opensdf
+*.cache
+*.log
+*.pdb
+*.ipch
+*.tlog
+*.db
+*.obj
+*.idb
+*.aps
+*.ncb
+*.VC.db
+*.VC.VC.opendb
+
+# Build output
+bin/
+obj/
+Build/
+Debug*/
+Release*/

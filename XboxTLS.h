@@ -141,6 +141,10 @@ bool XboxTLS_CreateContext(XboxTLSContext* ctx, const char* hostname);
  * @param e_len      Length of exponent in bytes
  * @return true on success, false if anchor limit is reached or parameters are invalid
  */
+
+typedef void(*XboxTLS_LogCallback)(const char* msg);
+void XboxTLS_SetLogCallback(XboxTLSContext* ctx, XboxTLS_LogCallback callback);
+
 bool XboxTLS_AddTrustAnchor_RSA(XboxTLSContext* ctx,
     const unsigned char* dn, size_t dn_len,
     const unsigned char* n, size_t n_len,
@@ -211,6 +215,24 @@ int XboxTLS_Read(XboxTLSContext* ctx, void* buf, int len);
  */
 void XboxTLS_Free(XboxTLSContext* ctx);
 
+// Performs the WebSocket upgrade over TLS
+bool XboxTLS_WebSocketUpgrade(XboxTLSContext* ctx, const char* host, const char* path, const char* origin);
+
+// Sends a WebSocket frame (unmasked, text-only for now)
+bool XboxTLS_SendWebSocketFrame(XboxTLSContext* ctx, const void* data, size_t len);
+
+// Receives a WebSocket frame (text-only, returns null-terminated string; must free())
+char* XboxTLS_ReceiveWebSocketFrame(XboxTLSContext* ctx, size_t* outLen, bool* isZlib);
+
+int XboxTLS_LastError(XboxTLSContext* ctx);
+
+void XboxTLS_ShutdownAndClose(XboxTLSContext* ctx);
+
+bool XboxTLS_IsAlive(XboxTLSContext* ctx);
+
+bool XboxTLS_HasFatalError(XboxTLSContext* ctx);
+
+bool XboxTLS_SocketDead(XboxTLSContext* ctx);
 
 #ifdef __cplusplus
 }
