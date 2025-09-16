@@ -56,7 +56,6 @@
 #include <stdint.h>
 #include "Debug.h"
 #include "XboxTLS.h"
-#include "TLSClient.h"
 #include "xkelib.h"
 #define MAX_ANCHORS 8
 #define XNCALLER_SYSAPP 2
