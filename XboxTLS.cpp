@@ -54,7 +54,6 @@
 #include "Debug.h"
 #include <xtl.h>
 #include <stdint.h>
-#include "Debug.h"
 #include "XboxTLS.h"
 #include "xkelib.h"
 #define MAX_ANCHORS 8
